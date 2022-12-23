@@ -1,0 +1,11 @@
+{{- if .Values.resiliency }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "typesense-cluster.fullname" . }}
+spec:
+  maxUnavailable: {{ .Values.resiliency }}
+  selector:
+    matchLabels:
+      {{- include "typesense-cluster.selectorLabels" . | nindent 6 }}
+{{- end -}}

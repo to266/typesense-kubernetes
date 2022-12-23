@@ -1,0 +1,155 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "typesense-cluster.fullname" . }}
+  labels:
+    {{- include "typesense-cluster.labels" . | nindent 4 }}
+spec:
+  replicas: {{ add 1 (mul ( default .Values.resiliency 0)  2) }}
+  serviceName: {{ include "typesense-cluster.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "typesense-cluster.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "typesense-cluster.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "typesense-cluster.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      volumes:
+        - name: nodelist
+          emptyDir: {}
+        - name: health
+          emptyDir: {}
+      initContainers:
+        - name: initial-nodes-values
+          image: busybox
+          command:
+            - sh
+            - "-c"
+            - echo $POD_IP:8107:8108 > /usr/share/typesense/nodes
+          env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          volumeMounts:
+          - name: nodelist
+            mountPath: /usr/share/typesense
+      containers:
+        # We need to parse the contents of the typical healthcheck response, 
+        # so we do it via sidecar as the default image does not have either wget nor curl.
+        - name: healthchecker
+          image: busybox
+          command:
+            - sleep
+            - inf
+          readinessProbe:
+            exec:
+              command:
+                - wget
+                - -q
+                - "-O"
+                - "/usr/share/health/status"
+                - "http://localhost:8108/health"
+          volumeMounts:
+          - name: health
+            mountPath: /usr/share/health
+        - name: typesense-node-resolver
+          {{- with .Values.nodeResolver }}
+          image: "{{ .image.repository }}:{{ .image.tag | default "latest" }}"
+          imagePullPolicy: {{ .image.pullPolicy }}
+          securityContext:
+            {{- toYaml .securityContext | nindent 12 }}
+          {{- end }}
+          command:
+           - /opt/tsns
+           - "-namespace=$NAMESPACE"
+           - "-service=$SERVICE"
+          env:
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: SERVICE
+            value: {{ include "typesense-cluster.fullname" . }}-resolver
+          volumeMounts:
+          - name: nodelist
+            mountPath: /usr/share/typesense
+        - name: typesense
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8108
+              protocol: TCP
+          command:
+            - "/opt/typesense-server"
+            - "-d"
+            - "/usr/share/typesense/data"
+            - "--api-port"
+            - "8108"
+            - "--peering-port"
+            - "8107"
+            - "--nodes"
+            - "/usr/share/typesense/nodes"
+          env:
+          - name: TYPESENSE_API_KEY
+            value: testing
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          readinessProbe:
+            exec:
+              command:
+                - grep
+                - "true"
+                - /usr/share/health/status
+          volumeMounts:
+          - name: health
+            mountPath: /usr/share/health
+          - name: nodelist
+            mountPath: /usr/share/typesense
+          - name: data
+            mountPath: /usr/share/typesense/data
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      {{- if gt .Values.resiliency 0 }}
+      {{- include "typesense-cluster.defaultAffinity" . | nindent 6 }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: {{ .Values.storage.storageClassName | default "" }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}
